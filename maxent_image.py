@@ -8,14 +8,17 @@ from scipy.optimize import minimize_scalar
 from scipy.sparse import diags
 
 # define a very small number
-tiny=np.finfo(1.).eps
+tiny=np.sqrt(np.finfo(1.).tiny)
 
 # define default intial value of x
 x_default=1.
 
-def psf_to_linear_map(psf,x_shape,y_shape):
+# definie minimisation method
+min_method="Newton-CG"
+
+def psf_to_linear_map(psf,y_shape,x_pad=False):
     
-    """
+    """ 
     
     Function:
         create linear map from vector x to y via psf
@@ -26,11 +29,11 @@ def psf_to_linear_map(psf,x_shape,y_shape):
     psf[:,:]: float
             point-spread function of observation
             
-    x_shape[2]: int
-        shape of model image
-            
     y_shape[2]: int
-            shape of observed image
+        shape of observed image
+            
+    x_pad: boolean
+            pad shape of model image to account for PSF
             
     Result
     ------
@@ -40,40 +43,59 @@ def psf_to_linear_map(psf,x_shape,y_shape):
     
     """
     
-    # set matrix dimensions
-    m=np.prod(x_shape)
-    n=np.prod(y_shape)
-    
-    # perform some broadcasting Kung Fu to get indices of A
+    # define model index bounds
+    if x_pad:
         
-    # make grid of indices [jx,jy] for psf
-    jx_min=-psf.shape[0]//2+1
-    jx_max=psf.shape[0]//2+1
-    jy_min=-psf.shape[1]//2+1
-    jy_max=psf.shape[1]//2+1
-    jx,jy=np.meshgrid(np.arange(jx_min,jx_max),np.arange(jy_min,jy_max),indexing="ij")
-    jx=jx.flatten()
-    jy=jy.flatten()
+        delta_i=psf.shape[0]//2
+        delta_j=psf.shape[1]//2
+        
+    else:
+        
+        delta_i=0
+        delta_j=0
     
-    # make n grids, off indices, offset by pix position
-    k=np.arange(n)
-    y_off=np.mod(k,y_shape[1])
-    x_off=((k-y_off)//y_shape[1])
-    jy=jy[np.newaxis,:]+y_off[:,np.newaxis]
-    jx=jx[np.newaxis,:]+x_off[:,np.newaxis]
+    xi_min=0-delta_i
+    xj_min=0-delta_j
+    xi_max=y_shape[0]+delta_i
+    xj_max=y_shape[1]+delta_j
     
-    # flatten out into indices of A
-    j=(jx*y_shape[1]+jy).flatten()
-    i=(np.arange(m)[:,np.newaxis]+np.zeros(psf.size,np.int)[np.newaxis,:]).flatten()
+    # define psf index bounds
+    zi_min=np.ceil(-psf.shape[0]/2.).astype(np.int)
+    zi_max=np.ceil(psf.shape[0]/2.).astype(np.int)
+    zj_min=np.ceil(-psf.shape[1]/2.).astype(np.int)
+    zj_max=np.ceil(psf.shape[1]/2.).astype(np.int)
     
-    # format psf data
-    data=(np.zeros(m)[:,np.newaxis]+psf.flatten()[np.newaxis,:]).flatten()
+    # define pixel grids for  observation and psf
+    xi,xj=np.meshgrid(np.arange(xi_min,xi_max),np.arange(xj_min,xj_max),indexing="ij")
+    zi,zj=np.meshgrid(np.arange(zi_min,zi_max),np.arange(zj_min,zj_max),indexing="ij")
     
-    # remove out of bounds entries
-    in_bounds=np.logical_and(j>=0,j<n)
-    data=data[in_bounds]
+    # make a map of y indices for every x index
+    yi=(xi[...,np.newaxis,np.newaxis]+zi[np.newaxis,np.newaxis,...]).flatten()
+    yj=(xj[...,np.newaxis,np.newaxis]+zj[np.newaxis,np.newaxis,...]).flatten()
+    
+    # locate within-bounds indices
+    in_bounds=np.all([yi>=0,yi<y_shape[0],yj>=0,yj<y_shape[1]],0)
+    
+    # set number of rows
+    m=y_shape[0]*y_shape[1]
+    
+    # set number of columns
+    n=(xi_max-xi_min)*(xj_max-xj_min)
+    
+    # set max number of entries per column
+    p=(zi_max-zi_min)*(zj_max-zj_min)
+    
+    # set i indices of map
+    i=yi*y_shape[1]+yj
     i=i[in_bounds]
+    
+    # set j indices of map
+    j=(np.arange(n)[:,np.newaxis]+np.zeros(p,np.int)[np.newaxis,:]).flatten()
     j=j[in_bounds]
+    
+    # set data of map
+    data=(psf.flatten()[np.newaxis,:]+np.zeros(n)[:,np.newaxis]).flatten()
+    data=data[in_bounds]
     
     # set matrix
     A=csr_matrix((data,[i,j]),shape=(m,n))
@@ -102,7 +124,7 @@ def ln(x):
         
         """
         
-        #return np.log(x)
+        #return ln(x)
         return np.log(np.where(x>0.,x,tiny))
 
 class estimator:
@@ -133,14 +155,12 @@ class estimator:
         
         """
         
-        # set shape of model to shape of observation
-        x_shape=y.shape
-        y_shape=y.shape
-        
+        self.y_shape=y.shape
+        self.x_shape=tuple(np.array(self.y_shape)+np.array(psf.shape)-1)
         self.y=y.flatten()
         
         # get psf linear map
-        self.A=psf_to_linear_map(psf,x_shape,y_shape)
+        self.A=psf_to_linear_map(psf,self.y_shape,True)
         
         # set noise matrix
         self.R_inv=diags(1./sigma_y.flatten()**2,0)
@@ -162,14 +182,15 @@ class estimator:
             
             # perform conjugate gradient minimisation
             start_time=time.time()
-            res=minimize(self.__J,self.x,method="trust-ncg",jac=self.__grad_J,hessp=self.__hessp_J)
+            res=minimize(self.__J,self.x,method=min_method,
+                         jac=self.__grad_J,hessp=self.__hessp_J)
             
             # next iteration will be faster if we use this result as initial state
             self.x=res.x
             
             # get reduced chi2
-            log_chi2=np.log(self.__chi2(self.x))
-            log_red_chi2=log_chi2-np.log(self.x.size)
+            log_chi2=ln(self.__chi2(self.x))
+            log_red_chi2=log_chi2-ln(self.x.size)
             print("log chi^2_nu:",log_red_chi2)
             print("time taken (s):",time.time()-start_time)
             
@@ -182,19 +203,20 @@ class estimator:
         i=0
         
         # initialise model vector
-        self.x=np.full(self.y.size,x_default)
+        self.x=np.full(self.A.shape[1],x_default)
         
         # initialse alpha
         # start with a high value and relax it to optimum
-        log_alpha_0=np.log((self.y**2*self.R_inv.data).sum())
-        log_alpha_1=log_alpha_0-1.
-        alpha_tol=np.log(1.+1./np.sqrt(self.x.size))
+        log_alpha_0=ln(0.5*self.__chi2(self.x)/self.__S(self.x))+1.
+        log_alpha_1=log_alpha_0-1
+        alpha_tol=ln(1.+1./np.sqrt(self.x.size))
         
         # keep track of log_alpha and log_chi2 values
         self.log_alpha=[]
         self.log_chi2=[]
         
         # perform secant iterations
+        print()
         print("solving for x")
         root=newton(secant_it,log_alpha_0,x1=log_alpha_1,tol=alpha_tol)
         self.alpha=np.exp(root)
@@ -237,49 +259,59 @@ class estimator:
             nonlocal self
             nonlocal i
             
-            # get finite differences
-            i+=1
-            print()
-            print("iteration:",i)
-            print("log alpha:",log_alpha)
+            # check if solution has been calculated before
+            if log_alpha in self.log_alpha:
+                
+                j=self.log_alpha.index(log_alpha)
+                kappa=self.kappa[j]
+                
+            else:
+                
+                # get finite differences
+                i+=1
+                print()
+                print("iteration:",i)
+                print("log alpha:",log_alpha)
             
-            # perform conjugate gradient minimisation
-            start_time=time.time()
+                # perform conjugate gradient minimisation
+                start_time=time.time()
+                
+                self.alpha=np.exp(log_alpha-h)
+                res=minimize(self.__J,self.x,method=min_method,
+                             jac=self.__grad_J,hessp=self.__hessp_J)
+                f_0=ln(self.__chi2(res.x))
+                
+                self.alpha=np.exp(log_alpha+h)
+                res=minimize(self.__J,res.x,method=min_method,
+                             jac=self.__grad_J,hessp=self.__hessp_J)
+                f_2=ln(self.__chi2(res.x))
+                
+                self.alpha=np.exp(log_alpha)
+                res=minimize(self.__J,res.x,method=min_method,
+                             jac=self.__grad_J,hessp=self.__hessp_J)
+                f_1=ln(self.__chi2(res.x))
+    
+                
+                # calculate curvature
+                dfdx=(f_2-f_0)/(2*h)
+                d2fdx2=(f_2-2*f_1+f_0)/h**2
+                kappa=d2fdx2/(1+dfdx**2)**(1.5)
+                
+                self.log_alpha.append(log_alpha)
+                self.log_chi2.append(f_1)
+                self.kappa.append(kappa)
+                self.x=res.x
             
-            self.alpha=np.exp(log_alpha-h)
-            res=minimize(self.__J,self.x,method="trust-ncg",jac=self.__grad_J,hessp=self.__hessp_J)
-            f_0=np.log(self.__chi2(res.x))
-            
-            self.alpha=np.exp(log_alpha+h)
-            res=minimize(self.__J,res.x,method="trust-ncg",jac=self.__grad_J,hessp=self.__hessp_J)
-            f_2=np.log(self.__chi2(res.x))
-            
-            self.alpha=np.exp(log_alpha)
-            res=minimize(self.__J,res.x,method="trust-ncg",jac=self.__grad_J,hessp=self.__hessp_J)
-            f_1=np.log(self.__chi2(res.x))
-
-            
-            # calculate curvature
-            dfdx=(f_2-f_0)/(2*h)
-            d2fdx2=(f_2-2*f_1+f_0)/h**2
-            kappa=d2fdx2/(1+dfdx**2)**(1.5)
-            
-            print("log chi^2_nu:",f_1-np.log(self.x.size))
-            print("curvature:",kappa)
-            print("time taken (s):",time.time()-start_time)
-            
-            self.log_alpha.append(log_alpha)
-            self.log_chi2.append(f_1)
-            self.kappa.append(kappa)
-            self.x=res.x
+                print("log chi^2_nu:",f_1-ln(self.x.size))
+                print("curvature:",kappa)
+                print("time taken (s):",time.time()-start_time)
             
             return -kappa
         
         # set iteration count
         i=0
-        j=np.max([1,self.log_alpha.size-3])
         log_alpha_0=self.log_alpha[0]
-        log_alpha_1=self.log_alpha[j]
+        log_alpha_1=self.log_alpha[self.log_alpha.size//2]
         
         # keep track of log_alpha, log_chi2, and kappa
         self.log_alpha=[]
@@ -287,15 +319,18 @@ class estimator:
         self.kappa=[]
         
         # set x_tol relative DoF optimal alpha
-        xtol=alpha_tol/np.log(self.alpha)
+        xtol=alpha_tol/ln(self.alpha)
         
         # find "kink" in curve
+        print()
         print("relaxing fit")
         minimum=minimize_scalar(neg_curvature,(log_alpha_0,log_alpha_1),
                             method="brent",options={"xtol":xtol})
         self.alpha=np.exp(minimum.x)
+        print()
         print("applying optimal fit")
-        res=minimize(self.__J,self.x,method="trust-ncg",jac=self.__grad_J,hessp=self.__hessp_J)
+        res=minimize(self.__J,self.x,method=min_method,
+                     jac=self.__grad_J,hessp=self.__hessp_J)
         self.x=res.x
         
         
@@ -309,6 +344,49 @@ class estimator:
         self.sigma_x=np.sqrt(2./self.__hess_diag_J(self.x))
         
         return
+    
+    def x_pad_image(self):
+        
+        """
+        
+        Function:
+            return padded x vector formatted as image
+        
+        """
+        
+        result=self.x.reshape(self.x_shape)
+    
+        return result
+    
+    def x_image(self):
+        
+        """
+        
+        Function:
+            return x vector formatted as image with (padding removed)
+        
+        """
+        
+        delta=tuple((np.array(self.x_shape)-np.array(self.y_shape))//2)
+        result=self.x.reshape(self.x_shape)
+        result=result[delta[0]:-delta[0],delta[1]:-delta[1]]
+    
+        return result
+    
+    def sigma_x_image(self):
+        
+        """
+        
+        Function:
+            return x vector formatted as image with (padding removed)
+        
+        """
+        
+        delta=tuple((np.array(self.x_shape)-np.array(self.y_shape))//2)
+        result=self.sigma_x.reshape(self.x_shape)
+        result=result[delta[0]:-delta[0],delta[1]:-delta[1]]
+    
+        return result
     
     
     # define loss function
@@ -401,7 +479,7 @@ class estimator:
                 -2*(sum_x-x)*x_log_f)/(-x*sum_x**3)
         
         # chi2 Hessian
-        hess_diag_chi2=np.array((self.ATR_inv.multiply(self.A)).sum(axis=0)).flatten()
+        hess_diag_chi2=np.array((self.ATR_inv.T.multiply(self.A)).sum(axis=0)).flatten()
         
         result=-self.alpha*hess_diag_S+hess_diag_chi2
         
